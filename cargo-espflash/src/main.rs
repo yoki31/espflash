@@ -1,32 +1,36 @@
-use crate::cargo_config::CargoConfig;
-use crate::error::NoTargetError;
-use crate::{cargo_config::parse_cargo_config, error::UnsupportedTargetError};
-use cargo_metadata::Message;
-use clap::{AppSettings, Parser};
-use error::Error;
-use espflash::{
-    cli::{clap::*, connect, monitor::monitor},
-    Chip, Config, FirmwareImage, ImageFormatId, PartitionTable,
-};
-use miette::{IntoDiagnostic, Result, WrapErr};
-use package_metadata::CargoEspFlashMeta;
 use std::{
     fs,
     path::PathBuf,
     process::{exit, Command, ExitStatus, Stdio},
     str::FromStr,
 };
+
+use cargo_metadata::Message;
+use clap::Parser;
+use espflash::{
+    cli::{
+        board_info, connect, flash_elf_image, monitor::monitor, partition_table, save_elf_as_image,
+        ConnectOpts, FlashConfigOpts, FlashOpts, PartitionTableOpts,
+    },
+    Chip, Config, ImageFormatId,
+};
+use miette::{IntoDiagnostic, Result, WrapErr};
+
+use crate::{
+    cargo_config::{parse_cargo_config, CargoConfig},
+    error::{Error, NoTargetError, UnsupportedTargetError},
+    package_metadata::CargoEspFlashMeta,
+};
+
 mod cargo_config;
 mod error;
 mod package_metadata;
 
 #[derive(Parser)]
-#[clap(global_setting = AppSettings::PropagateVersion)]
-#[clap(bin_name = "cargo")]
-#[clap(version = env!("CARGO_PKG_VERSION"))]
+#[clap(bin_name = "cargo", version, propagate_version = true)]
 struct Opts {
     #[clap(subcommand)]
-    sub_cmd: CargoSubCommand,
+    subcommand: CargoSubCommand,
 }
 
 #[derive(Parser)]
@@ -37,122 +41,155 @@ enum CargoSubCommand {
 #[derive(Parser)]
 struct EspFlashOpts {
     #[clap(flatten)]
-    flash_args: FlashArgs,
+    flash_opts: FlashOpts,
     #[clap(flatten)]
-    build_args: BuildArgs,
+    build_opts: BuildOpts,
     #[clap(flatten)]
-    connect_args: ConnectArgs,
+    connect_opts: ConnectOpts,
     #[clap(subcommand)]
-    sub_cmd: Option<SubCommand>,
+    subcommand: Option<SubCommand>,
 }
 
 #[derive(Parser)]
 pub enum SubCommand {
+    /// Display information about the connected board and exit without flashing
+    BoardInfo(ConnectOpts),
+    /// Save the image to disk instead of flashing to device
     SaveImage(SaveImageOpts),
-    BoardInfo(BoardInfoOpts),
+    /// Operations for partitions tables
+    PartitionTable(PartitionTableOpts),
+}
+
+#[derive(Parser)]
+pub struct BuildOpts {
+    /// Build the application using the release profile
+    #[clap(long)]
+    pub release: bool,
+    /// Example to build and flash
+    #[clap(long)]
+    pub example: Option<String>,
+    /// Specify a (binary) package within a workspace to be built
+    #[clap(long)]
+    pub package: Option<String>,
+    /// Comma delimited list of build features
+    #[clap(long, use_value_delimiter = true)]
+    pub features: Option<Vec<String>>,
+    /// Image format to flash
+    #[clap(long, possible_values = &["bootloader", "direct-boot"])]
+    pub format: Option<String>,
+    /// Target to build for
+    #[clap(long)]
+    pub target: Option<String>,
+    /// Unstable (nightly-only) flags to Cargo, see 'cargo -Z help' for details
+    #[clap(short = 'Z')]
+    pub unstable: Option<Vec<String>>,
+    #[clap(flatten)]
+    pub flash_config_opts: FlashConfigOpts,
+}
+
+#[derive(Parser)]
+pub struct SaveImageOpts {
+    #[clap(flatten)]
+    pub build_opts: BuildOpts,
+    /// File name to save the generated image to
+    pub file: PathBuf,
+    /// Boolean flag to merge binaries into single binary
+    #[clap(long, short = 'M')]
+    pub merge: bool,
+    /// Custom bootloader for merging
+    #[clap(long, short = 'B')]
+    pub bootloader: Option<PathBuf>,
+    /// Custom partition table for merging
+    #[clap(long, short = 'T')]
+    pub partition_table: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     miette::set_panic_hook();
 
-    let CargoSubCommand::Espflash(opts) = Opts::parse().sub_cmd;
+    let CargoSubCommand::Espflash(opts) = Opts::parse().subcommand;
 
-    let config = Config::load();
+    let config = Config::load()?;
     let metadata = CargoEspFlashMeta::load("Cargo.toml")?;
     let cargo_config = parse_cargo_config(".")?;
 
-    match opts.sub_cmd {
-        Some(SubCommand::BoardInfo(matches)) => board_info(matches, config, metadata, cargo_config),
-        Some(SubCommand::SaveImage(matches)) => save_image(matches, config, metadata, cargo_config),
-        None => flash(opts, config, metadata, cargo_config),
+    if let Some(subcommand) = opts.subcommand {
+        use SubCommand::*;
+
+        match subcommand {
+            BoardInfo(opts) => board_info(opts, config),
+            SaveImage(opts) => save_image(opts, metadata, cargo_config),
+            PartitionTable(opts) => partition_table(opts),
+        }
+    } else {
+        flash(opts, config, metadata, cargo_config)
     }
 }
 
 fn flash(
-    matches: EspFlashOpts,
+    opts: EspFlashOpts,
     config: Config,
     metadata: CargoEspFlashMeta,
     cargo_config: CargoConfig,
 ) -> Result<()> {
-    // Connect the Flasher to the target device and print the board information
-    // upon connection. If the '--board-info' flag has been provided, we have
-    // nothing left to do so exit early.
-    let mut flasher = connect(&matches.connect_args, &config)?;
-    flasher.board_info()?;
+    let mut flasher = connect(&opts.connect_opts, &config)?;
 
-    if matches.flash_args.board_info {
-        return Ok(());
-    }
-
-    let path = build(&matches.build_args, &cargo_config, Some(flasher.chip()))
+    let artifact_path = build(&opts.build_opts, &cargo_config, Some(flasher.chip()))
         .wrap_err("Failed to build project")?;
 
-    // If the '--bootloader' option is provided, load the binary file at the
-    // specified path.
-    let bootloader = if let Some(path) = matches
-        .flash_args
-        .bootloader
-        .as_deref()
-        .or_else(|| metadata.bootloader.as_deref())
-    {
-        let path = fs::canonicalize(path).into_diagnostic()?;
-        let data = fs::read(path).into_diagnostic()?;
-        Some(data)
-    } else {
-        None
-    };
-
-    // If the '--partition-table' option is provided, load the partition table from
-    // the CSV at the specified path.
-    let partition_table = if let Some(path) = matches
-        .flash_args
-        .partition_table
-        .as_deref()
-        .or_else(|| metadata.partition_table.as_deref())
-    {
-        let path = fs::canonicalize(path).into_diagnostic()?;
-        let data = fs::read_to_string(path)
-            .into_diagnostic()
-            .wrap_err("Failed to open partition table")?;
-        let table =
-            PartitionTable::try_from_str(data).wrap_err("Failed to parse partition table")?;
-        Some(table)
-    } else {
-        None
-    };
-
-    let image_format = matches
-        .build_args
-        .format
-        .as_deref()
-        .map(ImageFormatId::from_str)
-        .transpose()?
-        .or(metadata.format);
+    // Print the board information once the project has successfully built. We do
+    // here rather than upon connection to show the Cargo output prior to the board
+    // information, rather than breaking up cargo-espflash's output.
+    flasher.board_info()?;
 
     // Read the ELF data from the build path and load it to the target.
-    let elf_data = fs::read(path).into_diagnostic()?;
-    if matches.flash_args.ram {
+    let elf_data = fs::read(artifact_path).into_diagnostic()?;
+
+    if opts.flash_opts.ram {
         flasher.load_elf_to_ram(&elf_data)?;
     } else {
-        flasher.load_elf_to_flash_with_format(
+        let bootloader = opts
+            .flash_opts
+            .bootloader
+            .as_deref()
+            .or(metadata.bootloader.as_deref());
+
+        let partition_table = opts
+            .flash_opts
+            .partition_table
+            .as_deref()
+            .or(metadata.partition_table.as_deref());
+
+        let image_format = opts
+            .build_opts
+            .format
+            .as_deref()
+            .map(ImageFormatId::from_str)
+            .transpose()?
+            .or(metadata.format);
+
+        flash_elf_image(
+            &mut flasher,
             &elf_data,
             bootloader,
             partition_table,
             image_format,
+            opts.build_opts.flash_config_opts.flash_mode,
+            opts.build_opts.flash_config_opts.flash_size,
+            opts.build_opts.flash_config_opts.flash_freq,
         )?;
     }
-    println!("\nFlashing has completed!");
 
-    if matches.flash_args.monitor {
-        monitor(flasher.into_serial()).into_diagnostic()?;
+    if opts.flash_opts.monitor {
+        let pid = flasher.get_usb_pid()?;
+        monitor(flasher.into_serial(), &elf_data, pid).into_diagnostic()?;
     }
 
-    // We're all done!
     Ok(())
 }
 
 fn build(
-    build_options: &BuildArgs,
+    build_options: &BuildOpts,
     cargo_config: &CargoConfig,
     chip: Option<Chip>,
 ) -> Result<PathBuf> {
@@ -187,25 +224,32 @@ fn build(
     // Build the list of arguments to pass to 'cargo build'. We will always
     // explicitly state the target, as it must be provided as either a command-line
     // argument or in the cargo config file.
-    let mut args = vec!["--target", target];
+    let mut args = vec!["--target".to_string(), target.to_string()];
 
     if build_options.release {
-        args.push("--release");
+        args.push("--release".to_string());
     }
 
-    if let Some(example) = build_options.example.as_deref() {
-        args.push("--example");
-        args.push(example);
+    if let Some(example) = &build_options.example {
+        args.push("--example".to_string());
+        args.push(example.to_string());
     }
 
-    if let Some(package) = build_options.package.as_deref() {
-        args.push("--package");
-        args.push(package);
+    if let Some(package) = &build_options.package {
+        args.push("--package".to_string());
+        args.push(package.to_string());
     }
 
-    if let Some(features) = build_options.features.as_deref() {
-        args.push("--features");
-        args.extend(features.iter().map(|f| f.as_str()));
+    if let Some(features) = &build_options.features {
+        args.push("--features".to_string());
+        args.push(features.join(","));
+    }
+
+    if let Some(unstable) = &build_options.unstable {
+        for item in unstable.iter() {
+            args.push("-Z".to_string());
+            args.push(item.to_string());
+        }
     }
 
     // Invoke the 'cargo build' command, passing our list of arguments.
@@ -256,20 +300,18 @@ fn build(
 
     // If no target artifact was found, we don't have a path to return.
     let target_artifact = target_artifact.ok_or(Error::NoArtifact)?;
-
     let artifact_path = target_artifact.executable.unwrap().into();
 
     Ok(artifact_path)
 }
 
 fn save_image(
-    matches: SaveImageOpts,
-    _config: Config,
+    opts: SaveImageOpts,
     metadata: CargoEspFlashMeta,
     cargo_config: CargoConfig,
 ) -> Result<()> {
-    let target = matches
-        .build_args
+    let target = opts
+        .build_opts
         .target
         .as_deref()
         .or_else(|| cargo_config.target())
@@ -278,45 +320,30 @@ fn save_image(
 
     let chip = Chip::from_target(target).ok_or_else(|| Error::UnknownTarget(target.into()))?;
 
-    let path = build(&matches.build_args, &cargo_config, Some(chip))?;
+    let path = build(&opts.build_opts, &cargo_config, Some(chip))?;
     let elf_data = fs::read(path).into_diagnostic()?;
 
-    let image = FirmwareImage::from_data(&elf_data)?;
-
-    let image_format = matches
-        .build_args
+    let image_format = opts
+        .build_opts
         .format
         .as_deref()
         .map(ImageFormatId::from_str)
         .transpose()?
         .or(metadata.format);
 
-    let flash_image = chip.get_flash_image(&image, None, None, image_format, None)?;
-    let parts: Vec<_> = flash_image.ota_segments().collect();
+    save_elf_as_image(
+        chip,
+        &elf_data,
+        opts.file,
+        image_format,
+        opts.build_opts.flash_config_opts.flash_mode,
+        opts.build_opts.flash_config_opts.flash_size,
+        opts.build_opts.flash_config_opts.flash_freq,
+        opts.merge,
+        opts.bootloader,
+        opts.partition_table,
+    )?;
 
-    let out_path = matches.file;
-
-    match parts.as_slice() {
-        [single] => fs::write(out_path, &single.data).into_diagnostic()?,
-        parts => {
-            for part in parts {
-                let part_path = format!("{:#x}_{}", part.addr, out_path);
-                fs::write(part_path, &part.data).into_diagnostic()?
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn board_info(
-    matches: BoardInfoOpts,
-    config: Config,
-    _metadata: CargoEspFlashMeta,
-    _cargo_config: CargoConfig,
-) -> Result<()> {
-    let mut flasher = connect(&matches.connect_args, &config)?;
-    flasher.board_info()?;
     Ok(())
 }
 

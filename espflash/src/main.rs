@@ -1,157 +1,153 @@
-use clap::{AppSettings, IntoApp, Parser};
-use espflash::cli::monitor::monitor;
+use std::{fs, mem::swap, path::PathBuf, str::FromStr};
+
+use clap::{IntoApp, Parser};
 use espflash::{
-    cli::{clap::*, connect},
-    Chip, Config, Error, FirmwareImage, ImageFormatId, PartitionTable,
+    cli::{
+        board_info, connect, flash_elf_image, monitor::monitor, partition_table, save_elf_as_image,
+        ConnectOpts, FlashConfigOpts, FlashOpts, PartitionTableOpts,
+    },
+    Chip, Config, ImageFormatId,
 };
 use miette::{IntoDiagnostic, Result, WrapErr};
-use std::{
-    fs::{self, read, read_to_string},
-    mem::swap,
-    str::FromStr,
-};
 
 #[derive(Parser)]
-#[clap(global_setting = AppSettings::PropagateVersion)]
-#[clap(version = env!("CARGO_PKG_VERSION"))]
+#[clap(version, propagate_version = true)]
 struct Opts {
     /// Image format to flash
-    #[clap(long)]
+    #[clap(long, possible_values = &["bootloader", "direct-boot"])]
     pub format: Option<String>,
     #[clap(flatten)]
-    flash_args: FlashArgs,
+    pub flash_config_opts: FlashConfigOpts,
     #[clap(flatten)]
-    connect_args: ConnectArgs,
+    flash_opts: FlashOpts,
+    #[clap(flatten)]
+    connect_opts: ConnectOpts,
     /// ELF image to flash
     image: Option<String>,
     #[clap(subcommand)]
-    sub_cmd: Option<SubCommand>,
+    subcommand: Option<SubCommand>,
 }
 
 #[derive(Parser)]
 pub enum SubCommand {
+    /// Display information about the connected board and exit without flashing
+    BoardInfo(ConnectOpts),
+    /// Save the image to disk instead of flashing to device
     SaveImage(SaveImageOpts),
-    BoardInfo(BoardInfoOpts),
+    /// Operations for partitions tables
+    PartitionTable(PartitionTableOpts),
 }
 
-/// Save the image to disk instead of flashing to device
 #[derive(Parser)]
 pub struct SaveImageOpts {
+    #[clap(flatten)]
+    pub flash_config_opts: FlashConfigOpts,
     /// Image format to flash
-    #[clap(long)]
+    #[clap(long, possible_values = &["bootloader", "direct-boot"])]
     format: Option<String>,
     /// the chip to create an image for
     chip: Chip,
     /// ELF image to flash
-    image: String,
+    image: PathBuf,
     /// File name to save the generated image to
-    file: String,
+    file: PathBuf,
+    /// Boolean flag, if set, bootloader, partition table and application binaries will be merged into single binary
+    #[clap(long, short = 'M')]
+    pub merge: bool,
+    /// Custom bootloader for merging
+    #[clap(long, short = 'B')]
+    pub bootloader: Option<PathBuf>,
+    /// Custom partition table for merging
+    #[clap(long, short = 'T')]
+    pub partition_table: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     miette::set_panic_hook();
 
     let mut opts = Opts::parse();
-    let config = Config::load();
+    let config = Config::load()?;
 
-    // If only a single argument is passed, it's always going to be the ELF file. In
-    // the case that the serial port was not provided as a command-line argument,
-    // we will either load the value specified in the configuration file or do port
-    // auto-detection instead.
-    if opts.image.is_none() && opts.connect_args.serial.is_some() {
-        swap(&mut opts.image, &mut opts.connect_args.serial);
+    if opts.subcommand.is_none() {
+        // If neither the IMAGE nor SERIAL arguments have been provided, print the
+        // help message and exit.
+        if opts.image.is_none() && opts.connect_opts.serial.is_none() {
+            Opts::command().print_help().ok();
+            return Ok(());
+        }
+
+        // If only a single argument is passed, it *should* always be the ELF file. In
+        // the case that the serial port was not provided as a command-line argument, we
+        // will either load the value specified in the configuration file or do port
+        // auto-detection instead.
+        if opts.image.is_none() && opts.connect_opts.serial.is_some() {
+            swap(&mut opts.image, &mut opts.connect_opts.serial);
+        }
     }
 
-    match opts.sub_cmd {
-        Some(SubCommand::BoardInfo(opts)) => board_info(opts, config),
-        Some(SubCommand::SaveImage(opts)) => save_image(opts, config),
-        None => flash(opts, config),
+    if let Some(subcommand) = opts.subcommand {
+        use SubCommand::*;
+
+        match subcommand {
+            BoardInfo(opts) => board_info(opts, config),
+            SaveImage(opts) => save_image(opts),
+            PartitionTable(opts) => partition_table(opts),
+        }
+    } else {
+        flash(opts, config)
     }
 }
 
 fn flash(opts: Opts, config: Config) -> Result<()> {
-    if opts.flash_args.board_info {
-        return board_info(
-            BoardInfoOpts {
-                connect_args: opts.connect_args,
-            },
-            config,
-        );
-    }
-    let ram = opts.flash_args.ram;
-    let bootloader_path = opts.flash_args.bootloader;
-    let partition_table_path = opts.flash_args.partition_table;
-    let image_format_string = opts.format;
+    let mut flasher = connect(&opts.connect_opts, &config)?;
+    flasher.board_info()?;
 
-    let elf = match opts.image {
-        Some(elf) => elf,
-        _ => {
-            Opts::into_app().print_help().ok();
-            return Ok(());
-        }
+    let elf = if let Some(elf) = opts.image {
+        elf
+    } else {
+        Opts::command().print_help().ok();
+        return Ok(());
     };
 
-    let mut flasher = connect(&opts.connect_args, &config)?;
+    // Read the ELF data from the build path and load it to the target.
+    let elf_data = fs::read(&elf).into_diagnostic()?;
 
-    let input_bytes = read(&elf)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("Failed to open elf image \"{}\"", &elf))?;
-
-    if ram {
-        flasher.load_elf_to_ram(&input_bytes)?;
+    if opts.flash_opts.ram {
+        flasher.load_elf_to_ram(&elf_data)?;
     } else {
-        let bootloader = bootloader_path
-            .as_deref()
-            .map(read)
-            .transpose()
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to open bootloader image \"{}\"",
-                    bootloader_path.unwrap()
-                )
-            })?;
-        let image_format = image_format_string
+        let bootloader = opts.flash_opts.bootloader.as_deref();
+        let partition_table = opts.flash_opts.partition_table.as_deref();
+
+        let image_format = opts
+            .format
             .as_deref()
             .map(ImageFormatId::from_str)
             .transpose()?;
-        let partition_table = partition_table_path
-            .as_deref()
-            .map(|path| {
-                let table = read_to_string(path)?;
-                PartitionTable::try_from_str(&table).map_err(Error::from)
-            })
-            .transpose()
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to load partition table \"{}\"",
-                    partition_table_path.unwrap()
-                )
-            })?;
-        flasher.load_elf_to_flash_with_format(
-            &input_bytes,
+
+        flash_elf_image(
+            &mut flasher,
+            &elf_data,
             bootloader,
             partition_table,
             image_format,
+            opts.flash_config_opts.flash_mode,
+            opts.flash_config_opts.flash_size,
+            opts.flash_config_opts.flash_freq,
         )?;
     }
 
-    if opts.flash_args.monitor {
-        monitor(flasher.into_serial()).into_diagnostic()?;
+    if opts.flash_opts.monitor {
+        let pid = flasher.get_usb_pid()?;
+        monitor(flasher.into_serial(), &elf_data, pid).into_diagnostic()?;
     }
 
     Ok(())
 }
 
-fn save_image(opts: SaveImageOpts, _config: Config) -> Result<()> {
-    let chip = opts.chip;
-    let elf = opts.image;
-    let elf_data = fs::read(&elf)
+fn save_image(opts: SaveImageOpts) -> Result<()> {
+    let elf_data = fs::read(&opts.image)
         .into_diagnostic()
-        .wrap_err_with(|| format!("Failed to open image {}", elf))?;
-
-    let image = FirmwareImage::from_data(&elf_data)?;
+        .wrap_err_with(|| format!("Failed to open image {}", opts.image.display()))?;
 
     let image_format = opts
         .format
@@ -159,26 +155,18 @@ fn save_image(opts: SaveImageOpts, _config: Config) -> Result<()> {
         .map(ImageFormatId::from_str)
         .transpose()?;
 
-    let flash_image = chip.get_flash_image(&image, None, None, image_format, None)?;
-    let parts: Vec<_> = flash_image.ota_segments().collect();
+    save_elf_as_image(
+        opts.chip,
+        &elf_data,
+        opts.file,
+        image_format,
+        opts.flash_config_opts.flash_mode,
+        opts.flash_config_opts.flash_size,
+        opts.flash_config_opts.flash_freq,
+        opts.merge,
+        opts.bootloader,
+        opts.partition_table,
+    )?;
 
-    let out_path = opts.file;
-
-    match parts.as_slice() {
-        [single] => fs::write(out_path, &single.data).into_diagnostic()?,
-        parts => {
-            for part in parts {
-                let part_path = format!("{:#x}_{}", part.addr, out_path);
-                fs::write(part_path, &part.data).into_diagnostic()?
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn board_info(opts: BoardInfoOpts, config: Config) -> Result<()> {
-    let mut flasher = connect(&opts.connect_args, &config)?;
-    flasher.board_info()?;
     Ok(())
 }

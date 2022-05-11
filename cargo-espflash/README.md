@@ -15,7 +15,7 @@ $ cargo install cargo-espflash
 ## Usage
 
 ```text
-cargo-espflash 1.1.0
+cargo-espflash 1.5.1
 
 USAGE:
     cargo espflash [OPTIONS] [SERIAL] [SUBCOMMAND]
@@ -24,24 +24,26 @@ ARGS:
     <SERIAL>    Serial port connected to target device
 
 OPTIONS:
-        --board-info
-            Display the connected board's information (deprecated, use the `board-info` subcommand
-            instead)
-
         --bootloader <BOOTLOADER>
             Path to a binary (.bin) bootloader file
 
         --example <EXAMPLE>
             Example to build and flash
 
-        --features <FEATURES>...
+    -f, --flash-freq <FREQUENCY>
+            Flash frequency [possible values: 20M, 26M, 40M, 80M]
+
+        --features <FEATURES>
             Comma delimited list of build features
 
         --format <FORMAT>
-            Image format to flash (bootloader/direct-boot)
+            Image format to flash [possible values: bootloader, direct-boot]
 
     -h, --help
             Print help information
+
+    -m, --flash-mode <MODE>
+            Flash mode to use [possible values: QIO, QOUT, DIO, DOUT]
 
         --monitor
             Open a serial monitor after flashing
@@ -58,6 +60,10 @@ OPTIONS:
         --release
             Build the application using the release profile
 
+    -s, --flash-size <SIZE>
+            Flash size of the target [possible values: 256KB, 512KB, 1MB, 2MB, 4MB, 8MB, 16MB, 32MB,
+            64MB, 128MB]
+
         --speed <SPEED>
             Baud rate at which to flash target device
 
@@ -67,10 +73,14 @@ OPTIONS:
     -V, --version
             Print version information
 
+    -Z <UNSTABLE>
+            Unstable (nightly-only) flags to Cargo, see 'cargo -Z help' for details
+
 SUBCOMMANDS:
-    board-info    Display the connected board's information
-    help          Print this message or the help of the given subcommand(s)
-    save-image    Save the image to disk instead of flashing to device
+    board-info         Display information about the connected board and exit without flashing
+    help               Print this message or the help of the given subcommand(s)
+    partition-table    Operations for partitions tables
+    save-image         Save the image to disk instead of flashing to device
 ```
 
 ## Configuration
@@ -89,9 +99,9 @@ An example configuration file may look as follows (note that TOML does _not_ sup
 [connection]
 serial = "/dev/ttyUSB0"
 
-[usb_device]
-vid = 12346 # 0x303A
-pid = 32768 # 0x8000
+[[usb_device]]
+vid = "303A"
+pid = "8000"
 ```
 
 ## Package Metadata

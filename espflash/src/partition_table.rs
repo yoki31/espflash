@@ -1,22 +1,37 @@
-use crate::error::{
-    CSVError, DuplicatePartitionsError, InvalidSubTypeError, OverlappingPartitionsError,
-    PartitionTableError, UnalignedPartitionError,
+use std::{
+    cmp::{max, min},
+    fmt::{Display, Formatter, Write as _},
+    io::{Cursor, Write},
+    ops::Rem,
 };
+
+use binread::{BinRead, BinReaderExt};
+use comfy_table::{modifiers, presets::UTF8_FULL, Attribute, Cell, Color, Table};
 use md5::{Context, Digest};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::cmp::{max, min};
-use std::fmt::Write as _;
-use std::fmt::{Display, Formatter};
-use std::io::Write;
-use std::ops::Rem;
+use strum::IntoEnumIterator;
+use strum_macros::EnumIter;
+
+use crate::error::{
+    CSVError, DuplicatePartitionsError, InvalidChecksum, InvalidSubTypeError,
+    LengthNotMultipleOf32, NoAppError, NoEndMarker, OverlappingPartitionsError,
+    PartitionTableError, UnalignedPartitionError,
+};
 
 const MAX_PARTITION_LENGTH: usize = 0xC00;
 const PARTITION_TABLE_SIZE: usize = 0x1000;
+const PARTITION_SIZE: usize = 32;
+const PARTITION_ALIGNMENT: u32 = 0x10000;
+const MAGIC_BYTES: &[u8] = &[0xAA, 0x50];
+const MD5_PART_MAGIC_BYTES: &[u8] = &[
+    0xEB, 0xEB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+];
+const END_MARKER: [u8; 32] = [0xFF; 32];
 
-#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, BinRead)]
 #[repr(u8)]
-#[allow(dead_code)]
+#[br(little, repr = u8)]
 #[serde(rename_all = "lowercase")]
 pub enum Type {
     App = 0x00,
@@ -26,28 +41,14 @@ pub enum Type {
 impl Type {
     pub fn subtype_hint(&self) -> String {
         match self {
-            Type::App => "'factory', 'ota_0' through 'ota_15' and 'test'".into(),
+            Type::App => "'factory', 'ota_0' through 'ota_15', and 'test'".into(),
             Type::Data => {
-                let types = [
-                    DataType::Ota,
-                    DataType::Phy,
-                    DataType::Nvs,
-                    DataType::CoreDump,
-                    DataType::NvsKeys,
-                    DataType::EFuse,
-                    DataType::EspHttpd,
-                    DataType::Fat,
-                    DataType::Spiffs,
-                ];
+                let types = DataType::iter()
+                    .map(|dt| format!("'{}'", serde_plain::to_string(&dt).unwrap()))
+                    .collect::<Vec<_>>();
 
-                let mut out = format!("'{}'", serde_plain::to_string(&types[0]).unwrap());
-                for ty in &types[1..types.len() - 2] {
-                    let ser = serde_plain::to_string(&ty).unwrap();
-                    write!(&mut out, ", '{}'", ser).unwrap();
-                }
-
-                let ser = serde_plain::to_string(&types[types.len() - 1]).unwrap();
-                write!(&mut out, " and '{}'", ser).unwrap();
+                let mut out = types[0..types.len() - 2].join(", ");
+                write!(&mut out, ", and {}", types[types.len() - 1]).unwrap();
 
                 out
             }
@@ -56,17 +57,16 @@ impl Type {
 }
 
 impl Display for Type {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let ser = serde_plain::to_string(self).unwrap();
-        write!(f, "{}", ser)
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "{}", serde_plain::to_string(self).unwrap())
     }
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, BinRead)]
 #[repr(u8)]
-#[allow(dead_code)]
-#[serde(rename_all = "lowercase")]
+#[br(little, repr = u8)]
 pub enum AppType {
+    #[serde(rename = "factory")]
     Factory = 0x00,
     #[serde(rename = "ota_0")]
     Ota0 = 0x10,
@@ -100,12 +100,13 @@ pub enum AppType {
     Ota14 = 0x1e,
     #[serde(rename = "ota_15")]
     Ota15 = 0x1f,
+    #[serde(rename = "test")]
     Test = 0x20,
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Copy, Clone, Debug, Deserialize, EnumIter, Serialize, PartialEq, BinRead)]
 #[repr(u8)]
-#[allow(dead_code)]
+#[br(little, repr = u8)]
 #[serde(rename_all = "lowercase")]
 pub enum DataType {
     Ota = 0x00,
@@ -120,8 +121,13 @@ pub enum DataType {
     Spiffs = 0x82,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Copy, Clone)]
-#[allow(dead_code)]
+impl DataType {
+    fn is_multiple_allowed(self) -> bool {
+        matches!(self, Self::Fat | Self::Spiffs)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Copy, Clone, BinRead)]
 #[serde(untagged)]
 pub enum SubType {
     App(AppType),
@@ -129,12 +135,13 @@ pub enum SubType {
 }
 
 impl Display for SubType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let ser = match self {
             SubType::App(sub) => serde_plain::to_string(sub),
             SubType::Data(sub) => serde_plain::to_string(sub),
         }
         .unwrap();
+
         write!(f, "{}", ser)
     }
 }
@@ -146,9 +153,30 @@ impl SubType {
             SubType::Data(ty) => *ty as u8,
         }
     }
+
+    fn is_multiple_allowed(self) -> bool {
+        match self {
+            SubType::App(_) => false,
+            SubType::Data(ty) => ty.is_multiple_allowed(),
+        }
+    }
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, BinRead)]
+#[repr(u8)]
+#[br(little, repr = u8)]
+#[serde(rename_all = "lowercase")]
+pub enum Flags {
+    Encrypted = 0x1,
+}
+
+impl Flags {
+    pub fn as_u32(&self) -> u32 {
+        *self as u32
+    }
+}
+
+#[derive(Debug, PartialEq, Serialize)]
 pub struct PartitionTable {
     partitions: Vec<Partition>,
 }
@@ -191,10 +219,14 @@ impl PartitionTable {
         }
     }
 
-    /// Attempt to parse a partition table from the given string. For more
-    /// information on the partition table CSV format see:
+    /// Attempt to parse a CSV partition table from the given string.
+    ///
+    /// For more information on the partition table format see:
     /// https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/partition-tables.html
-    pub fn try_from_str<S: Into<String>>(data: S) -> Result<Self, PartitionTableError> {
+    pub fn try_from_str<S>(data: S) -> Result<Self, PartitionTableError>
+    where
+        S: Into<String>,
+    {
         let data = data.into();
         let mut reader = csv::ReaderBuilder::new()
             .comment(Some(b'#'))
@@ -202,40 +234,90 @@ impl PartitionTable {
             .trim(csv::Trim::All)
             .from_reader(data.trim().as_bytes());
 
+        // Default offset is 0x8000 in esp-idf, partition table size is 0x1000
+        let mut offset = 0x9000;
         let mut partitions = Vec::with_capacity(data.lines().count());
+
         for record in reader.records() {
             let record = record.map_err(|e| CSVError::new(e, data.clone()))?;
             let position = record.position();
-            let mut partition: Partition = record
+
+            let mut partition: DeserializedPartition = record
                 .deserialize(None)
                 .map_err(|e| CSVError::new(e, data.clone()))?;
+            partition.fixup_offset(&mut offset);
+
+            let mut partition = Partition::from(partition);
             partition.line = position.map(|pos| pos.line() as usize);
+
             partitions.push(partition);
         }
 
         let table = Self { partitions };
         table.validate(&data)?;
+
         Ok(table)
+    }
+
+    /// Attempt to parse a binary partition table from the given bytes.
+    ///
+    /// For more information on the partition table format see:
+    /// https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/partition-tables.html
+    pub fn try_from_bytes<S>(data: S) -> Result<Self, PartitionTableError>
+    where
+        S: Into<Vec<u8>>,
+    {
+        let data = data.into();
+        if data.len() % 32 != 0 {
+            return Err(PartitionTableError::LengthNotMultipleOf32(
+                LengthNotMultipleOf32 {},
+            ));
+        }
+        let mut md5 = Context::new();
+
+        let mut partitions = vec![];
+        for line in data.chunks_exact(PARTITION_SIZE) {
+            if line.starts_with(MD5_PART_MAGIC_BYTES) {
+                // The first 16 bytes are just the marker. The next 16 bytes is the actual md5
+                // string.
+                let digest_in_file = &line[16..32];
+                let digest_computed = *md5.clone().compute();
+                if digest_computed != digest_in_file {
+                    return Err(PartitionTableError::InvalidChecksum(InvalidChecksum {}));
+                }
+            } else if line == END_MARKER {
+                let table = Self { partitions };
+                return Ok(table);
+            } else {
+                let mut reader = Cursor::new(line);
+                let part: Partition = reader.read_le().unwrap();
+                partitions.push(part);
+                md5.consume(line);
+            }
+        }
+        Err(PartitionTableError::NoEndMarker(NoEndMarker {}))
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut result = Vec::with_capacity(PARTITION_TABLE_SIZE);
-        self.save(&mut result).unwrap();
+        self.save_bin(&mut result).unwrap();
+
         result
     }
 
-    pub fn save<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+    /// Write binary form of partition table into `writer`.
+    pub fn save_bin<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: Write,
+    {
         let mut hasher = HashWriter::new(writer);
         for partition in &self.partitions {
-            partition.save(&mut hasher)?;
+            partition.save_bin(&mut hasher)?;
         }
 
         let (writer, hash) = hasher.compute();
 
-        writer.write_all(&[
-            0xEB, 0xEB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF,
-        ])?;
+        writer.write_all(MD5_PART_MAGIC_BYTES)?;
         writer.write_all(&hash.0)?;
 
         let written = self.partitions.len() * PARTITION_SIZE + 32;
@@ -246,6 +328,29 @@ impl PartitionTable {
         Ok(())
     }
 
+    /// Write CSV form of partition table into `writer`.
+    pub fn save_csv<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: Write,
+    {
+        writeln!(writer, "# ESP-IDF Partition Table")?;
+        writeln!(writer, "# Name,   Type, SubType, Offset,  Size, Flags")?;
+        let mut csv = csv::Writer::from_writer(writer);
+        for partition in &self.partitions {
+            partition.save_csv(&mut csv)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn find(&self, name: &str) -> Option<&Partition> {
+        self.partitions.iter().find(|&p| p.name == name)
+    }
+
+    pub fn find_by_type(&self, ty: Type) -> Option<&Partition> {
+        self.partitions.iter().find(|&p| p.ty == ty)
+    }
+
     fn validate(&self, source: &str) -> Result<(), PartitionTableError> {
         for partition in &self.partitions {
             if let Some(line) = &partition.line {
@@ -253,6 +358,7 @@ impl PartitionTable {
                     SubType::App(_) => Type::App,
                     SubType::Data(_) => Type::Data,
                 };
+
                 if expected_type != partition.ty {
                     return Err(InvalidSubTypeError::new(
                         source,
@@ -262,7 +368,8 @@ impl PartitionTable {
                     )
                     .into());
                 }
-                if partition.ty == Type::App && partition.offset.rem(0x10000) != 0 {
+
+                if partition.ty == Type::App && partition.offset.rem(PARTITION_ALIGNMENT) != 0 {
                     return Err(UnalignedPartitionError::new(source, *line).into());
                 }
             }
@@ -277,13 +384,17 @@ impl PartitionTable {
                                 OverlappingPartitionsError::new(source, *line1, *line2).into()
                             );
                         }
+
                         if partition1.name == partition2.name {
                             return Err(DuplicatePartitionsError::new(
                                 source, *line1, *line2, "name",
                             )
                             .into());
                         }
-                        if partition1.sub_type == partition2.sub_type {
+
+                        if partition1.sub_type == partition2.sub_type
+                            && !SubType::is_multiple_allowed(partition1.sub_type)
+                        {
                             return Err(DuplicatePartitionsError::new(
                                 source, *line1, *line2, "sub-type",
                             )
@@ -294,25 +405,119 @@ impl PartitionTable {
             }
         }
 
+        if self.find_by_type(Type::App).is_none() {
+            return Err(PartitionTableError::NoApp(NoAppError::new(source)));
+        }
+
         Ok(())
+    }
+
+    pub fn pretty_print(&self) {
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL)
+            .apply_modifier(modifiers::UTF8_ROUND_CORNERS)
+            .set_header(vec![
+                Cell::new("Name")
+                    .fg(Color::Green)
+                    .add_attribute(Attribute::Bold),
+                Cell::new("Type")
+                    .fg(Color::Cyan)
+                    .add_attribute(Attribute::Bold),
+                Cell::new("SubType")
+                    .fg(Color::Magenta)
+                    .add_attribute(Attribute::Bold),
+                Cell::new("Offset")
+                    .fg(Color::Red)
+                    .add_attribute(Attribute::Bold),
+                Cell::new("Size")
+                    .fg(Color::Yellow)
+                    .add_attribute(Attribute::Bold),
+                Cell::new("Flags")
+                    .fg(Color::DarkCyan)
+                    .add_attribute(Attribute::Bold),
+            ]);
+        for part in &self.partitions {
+            table.add_row(vec![
+                Cell::new(&part.name).fg(Color::Green),
+                Cell::new(&part.ty.to_string()).fg(Color::Cyan),
+                Cell::new(&part.sub_type.to_string()).fg(Color::Magenta),
+                Cell::new(&format!("{:#x}", part.offset)).fg(Color::Red),
+                Cell::new(&format!("{:#x} ({}KiB)", part.size, part.size / 1024)).fg(Color::Yellow),
+                Cell::new(
+                    &part
+                        .flags
+                        .map(|x| format!("{:#x}", x.as_u32()))
+                        .unwrap_or_default(),
+                )
+                .fg(Color::DarkCyan),
+            ]);
+        }
+        println!("{table}");
     }
 }
 
-const PARTITION_SIZE: usize = 32;
-
 #[derive(Debug, Deserialize)]
-struct Partition {
+pub struct DeserializedPartition {
     #[serde(deserialize_with = "deserialize_partition_name")]
     name: String,
     ty: Type,
     sub_type: SubType,
-    #[serde(deserialize_with = "deserialize_partition_offset_or_size")]
-    offset: u32,
-    #[serde(deserialize_with = "deserialize_partition_offset_or_size")]
+    #[serde(deserialize_with = "deserialize_partition_offset")]
+    offset: Option<u32>,
+    #[serde(deserialize_with = "deserialize_partition_size")]
     size: u32,
-    flags: Option<u32>,
-    #[serde(skip)]
+    flags: Option<Flags>,
+}
+
+impl DeserializedPartition {
+    fn align(offset: u32, ty: Type) -> u32 {
+        let pad = match ty {
+            Type::App => PARTITION_ALIGNMENT,
+            Type::Data => 4,
+        };
+
+        if offset % pad != 0 {
+            offset + pad - (offset % pad)
+        } else {
+            offset
+        }
+    }
+
+    fn fixup_offset(&mut self, offset: &mut u32) {
+        if self.offset.is_none() {
+            self.offset = Some(Self::align(*offset, self.ty));
+        }
+
+        *offset = self.offset.unwrap() + self.size;
+    }
+}
+
+#[derive(Debug, BinRead, Serialize)]
+#[br(magic = b"\xAA\x50", assert(!name.is_empty()))]
+pub struct Partition {
+    ty: Type,
+    sub_type: SubType,
+    offset: u32,
+    size: u32,
+    #[br(count = 16)]
+    #[br(map = |s: Vec<u8>| String::from_utf8_lossy(&s).trim_matches(char::from(0)).to_string())]
+    name: String,
+    #[br(try)]
+    flags: Option<Flags>,
+    #[br(ignore)]
     line: Option<usize>,
+}
+
+impl PartialEq for Partition {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty == other.ty
+            && self.sub_type == other.sub_type
+            && self.offset == other.offset
+            && self.size == other.size
+            && self.name == other.name
+            && self.flags == other.flags
+    }
 }
 
 impl Partition {
@@ -321,7 +526,7 @@ impl Partition {
         sub_type: SubType,
         offset: u32,
         size: u32,
-        flags: Option<u32>,
+        flags: Option<Flags>,
     ) -> Self {
         Partition {
             name,
@@ -337,8 +542,11 @@ impl Partition {
         }
     }
 
-    pub fn save<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        writer.write_all(&[0xAA, 0x50])?;
+    pub fn save_bin<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: Write,
+    {
+        writer.write_all(MAGIC_BYTES)?;
         writer.write_all(&[self.ty as u8, self.sub_type.as_u8()])?;
         writer.write_all(&self.offset.to_le_bytes())?;
         writer.write_all(&self.size.to_le_bytes())?;
@@ -350,7 +558,7 @@ impl Partition {
         writer.write_all(&name_bytes)?;
 
         let flags = match &self.flags {
-            Some(f) => f.to_le_bytes(),
+            Some(f) => f.as_u32().to_le_bytes(),
             None => 0u32.to_le_bytes(),
         };
         writer.write_all(&flags)?;
@@ -358,8 +566,48 @@ impl Partition {
         Ok(())
     }
 
+    pub fn save_csv<W>(&self, csv: &mut csv::Writer<W>) -> std::io::Result<()>
+    where
+        W: Write,
+    {
+        csv.write_record(&[
+            &self.name,
+            &self.ty.to_string(),
+            &self.sub_type.to_string(),
+            &format!("{:#x}", self.offset),
+            &format!("{:#x}", self.size),
+            &self
+                .flags
+                .map(|x| format!("{:#x}", x.as_u32()))
+                .unwrap_or_default(),
+        ])?;
+        Ok(())
+    }
+
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+
+    pub fn flags(&self) -> Option<Flags> {
+        self.flags
+    }
+
     fn overlaps(&self, other: &Partition) -> bool {
         max(self.offset, other.offset) < min(self.offset + self.size, other.offset + other.size)
+    }
+}
+
+impl From<DeserializedPartition> for Partition {
+    fn from(p: DeserializedPartition) -> Self {
+        Partition {
+            name: p.name,
+            ty: p.ty,
+            sub_type: p.sub_type,
+            offset: p.offset.unwrap(),
+            size: p.size,
+            flags: p.flags,
+            line: None,
+        }
     }
 }
 
@@ -380,7 +628,7 @@ where
     Ok(maybe_truncated)
 }
 
-fn deserialize_partition_offset_or_size<'de, D>(deserializer: D) -> Result<u32, D::Error>
+fn deserialize_partition_offset_or_size<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -391,17 +639,17 @@ where
 
     // NOTE: Partitions of type 'app' must be placed at offsets aligned to 0x10000
     //       (64K).
-    // TODO: The specification states that offsets may be left blank, however that
-    //       is not presently supported in this implementation.
-    if buf.starts_with("0x") {
+    if buf.trim().is_empty() {
+        Ok(None)
+    } else if buf.starts_with("0x") {
         // Hexadecimal format
         let src = buf.trim_start_matches("0x");
         let size = u32::from_str_radix(src, 16).unwrap();
 
-        Ok(size)
+        Ok(Some(size))
     } else if let Ok(size) = buf.parse::<u32>() {
         // Decimal format
-        Ok(size)
+        Ok(Some(size))
     } else if let Some(captures) = re.captures(&buf) {
         // Size multiplier format (1k, 2M, etc.)
         let digits = captures.get(1).unwrap().as_str().parse::<u32>().unwrap();
@@ -411,18 +659,38 @@ where
             _ => unreachable!(),
         };
 
-        Ok(digits * multiplier)
+        Ok(Some(digits * multiplier))
     } else {
         Err(Error::custom("invalid partition size/offset format"))
     }
 }
 
-struct HashWriter<W: Write> {
+fn deserialize_partition_offset<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_partition_offset_or_size(deserializer)
+}
+
+fn deserialize_partition_size<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let deserialized = deserialize_partition_offset_or_size(deserializer)?;
+    deserialized.ok_or_else(|| Error::custom("invalid partition size/offset format"))
+}
+
+struct HashWriter<W> {
     inner: W,
     hasher: Context,
 }
 
-impl<W: Write> Write for HashWriter<W> {
+impl<W> Write for HashWriter<W>
+where
+    W: Write,
+{
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.hasher.write_all(buf)?;
         self.inner.write(buf)
@@ -433,7 +701,10 @@ impl<W: Write> Write for HashWriter<W> {
     }
 }
 
-impl<W: Write> HashWriter<W> {
+impl<W> HashWriter<W>
+where
+    W: Write,
+{
     pub fn new(inner: W) -> Self {
         HashWriter {
             inner,
@@ -455,7 +726,7 @@ mod tests {
 # Name,   Type, SubType, Offset,  Size, Flags
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 1M,
+factory,  app,  factory, 0x10000, 1M, encrypted
 ";
 
     const PTABLE_1: &str = "
@@ -467,6 +738,51 @@ phy_init, data, phy,     0xf000,  0x1000,
 factory,  app,  factory, 0x10000,  1M,
 ota_0,    app,  ota_0,   0x110000, 1M,
 ota_1,    app,  ota_1,   0x210000, 1M,
+";
+
+    const PTABLE_2: &str = "
+# ESP-IDF Partition Table
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,           ,  0x4000,
+phy_init, data, phy,           ,  0x1000,
+factory,  app,  factory,       ,  1M,
+";
+
+    const PTABLE_3: &str = "
+# ESP-IDF Partition Table
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,    0x10000,  0x4000,
+phy_init, data, phy,           ,  0x1000,
+factory,  app,  factory,       ,  1M,
+";
+
+    const PTABLE_SPIFFS: &str = "
+# ESP-IDF Partition Table
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x4000,
+otadata,  data, ota,     0xd000,  0x2000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000,  1M,
+a,        data,  spiffs, 0x110000, 1M,
+b,        data,  spiffs, 0x210000, 1M,
+";
+
+    const PTABLE_NO_FACTORY: &str = "
+# ESP-IDF Partition Table
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x4000,
+otadata,  data, ota,     0xd000,  0x2000,
+phy_init, data, phy,     0xf000,  0x1000,
+ota_0,    app,  ota_0,   , 1M,
+ota_1,    app,  ota_1,   , 1M,
+";
+
+    const PTABLE_NO_APP: &str = "
+# ESP-IDF Partition Table
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x4000,
+otadata,  data, ota,     0xd000,  0x2000,
+phy_init, data, phy,     0xf000,  0x1000,
 ";
 
     #[test]
@@ -501,7 +817,64 @@ ota_1,    app,  ota_1,   0x210000, 1M,
         let pt0 = PartitionTable::try_from_str(PTABLE_0);
         assert!(pt0.is_ok());
 
+        let pt0 = pt0.unwrap();
+        let nvs = pt0.find("nvs").unwrap();
+        let fac = pt0.find("factory").unwrap();
+        assert_eq!(nvs.flags(), None);
+        assert_eq!(fac.flags(), Some(Flags::Encrypted));
+
         let pt1 = PartitionTable::try_from_str(PTABLE_1);
         assert!(pt1.is_ok());
+
+        let pt_spiffs = PartitionTable::try_from_str(PTABLE_SPIFFS);
+        assert!(pt_spiffs.is_ok());
+
+        PartitionTable::try_from_str(PTABLE_NO_FACTORY)
+            .expect("Failed to parse partition table without factory partition");
+
+        PartitionTable::try_from_str(PTABLE_NO_APP)
+            .expect_err("Failed to reject partition table without factory or ota partition");
+    }
+
+    #[test]
+    fn test_from_bytes() {
+        use std::fs::{read, read_to_string};
+        let binary_table = read("./tests/data/partitions.bin").unwrap();
+        let binary_parsed = PartitionTable::try_from_bytes(binary_table).unwrap();
+
+        let csv_table = read_to_string("./tests/data/partitions.csv").unwrap();
+        let csv_parsed = PartitionTable::try_from_str(csv_table).unwrap();
+
+        assert_eq!(binary_parsed, csv_parsed);
+    }
+
+    #[test]
+    fn blank_offsets_are_filled_in() {
+        let pt2 = PartitionTable::try_from_str(PTABLE_2)
+            .expect("Failed to parse partition table with blank offsets");
+
+        assert_eq!(3, pt2.partitions.len());
+        assert_eq!(0x4000, pt2.partitions[0].size);
+        assert_eq!(0x1000, pt2.partitions[1].size);
+        assert_eq!(0x100000, pt2.partitions[2].size);
+
+        assert_eq!(0x9000, pt2.partitions[0].offset);
+        assert_eq!(0xd000, pt2.partitions[1].offset);
+        assert_eq!(0x10000, pt2.partitions[2].offset);
+    }
+
+    #[test]
+    fn first_offsets_are_respected() {
+        let pt3 = PartitionTable::try_from_str(PTABLE_3)
+            .expect("Failed to parse partition table with blank offsets");
+
+        assert_eq!(3, pt3.partitions.len());
+        assert_eq!(0x4000, pt3.partitions[0].size);
+        assert_eq!(0x1000, pt3.partitions[1].size);
+        assert_eq!(0x100000, pt3.partitions[2].size);
+
+        assert_eq!(0x10000, pt3.partitions[0].offset);
+        assert_eq!(0x14000, pt3.partitions[1].offset);
+        assert_eq!(0x20000, pt3.partitions[2].offset);
     }
 }

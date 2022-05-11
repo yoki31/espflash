@@ -1,8 +1,12 @@
-use std::{io::Write, thread::sleep, time::Duration};
+use std::{
+    io::{BufWriter, Write},
+    thread::sleep,
+    time::Duration,
+};
 
 use binread::{io::Cursor, BinRead, BinReaderExt};
 use bytemuck::{Pod, Zeroable};
-use serialport::SerialPort;
+use serialport::{SerialPort, UsbPortInfo};
 use slip_codec::SlipDecoder;
 
 use crate::{
@@ -10,6 +14,9 @@ use crate::{
     encoder::SlipEncoder,
     error::{ConnectionError, Error, ResultExt, RomError, RomErrorKind},
 };
+
+const DEFAULT_CONNECT_ATTEMPTS: usize = 7;
+pub const USB_SERIAL_JTAG_PID: u16 = 0x1001;
 
 #[derive(Debug, Copy, Clone, BinRead)]
 pub struct CommandResponse {
@@ -23,6 +30,7 @@ pub struct CommandResponse {
 
 pub struct Connection {
     serial: Box<dyn SerialPort>,
+    port_info: UsbPortInfo,
     decoder: SlipDecoder,
 }
 
@@ -36,39 +44,122 @@ struct WriteRegParams {
 }
 
 impl Connection {
-    pub fn new(serial: Box<dyn SerialPort>) -> Self {
+    pub fn new(serial: Box<dyn SerialPort>, port_info: UsbPortInfo) -> Self {
         Connection {
             serial,
+            port_info,
             decoder: SlipDecoder::new(),
         }
     }
 
-    pub fn reset(&mut self) -> Result<(), Error> {
-        sleep(Duration::from_millis(100));
+    pub fn begin(&mut self) -> Result<(), Error> {
+        let mut extra_delay = false;
+        for i in 0..DEFAULT_CONNECT_ATTEMPTS {
+            if self.connect_attempt(extra_delay).is_err() {
+                extra_delay = !extra_delay;
 
-        self.serial.write_data_terminal_ready(false)?;
-        self.serial.write_request_to_send(true)?;
+                let delay_text = if extra_delay { "extra" } else { "default" };
+                println!("Unable to connect, retrying with {} delay...", delay_text);
+            } else {
+                // Print a blank line if more than one connection attempt was made to visually
+                // separate the status text and whatever comes next.
+                if i > 0 {
+                    println!();
+                }
+                return Ok(());
+            }
+        }
 
-        sleep(Duration::from_millis(100));
+        Err(Error::Connection(ConnectionError::ConnectionFailed))
+    }
 
-        self.serial.write_request_to_send(false)?;
+    fn connect_attempt(&mut self, extra_delay: bool) -> Result<(), Error> {
+        self.reset_to_flash(extra_delay)?;
+
+        for _ in 0..5 {
+            self.flush()?;
+            if self.sync().is_ok() {
+                return Ok(());
+            }
+        }
+
+        Err(Error::Connection(ConnectionError::ConnectionFailed))
+    }
+
+    fn sync(&mut self) -> Result<(), Error> {
+        self.with_timeout(CommandType::Sync.timeout(), |connection| {
+            connection.write_command(Command::Sync)?;
+            connection.flush()?;
+            sleep(Duration::from_millis(10));
+            for _ in 0..100 {
+                match connection.read_response()? {
+                    Some(response) if response.return_op == CommandType::Sync as u8 => {
+                        if response.status == 1 {
+                            let _error = connection.flush();
+                            return Err(Error::RomError(RomError::new(
+                                CommandType::Sync,
+                                RomErrorKind::from(response.error),
+                            )));
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+
+            Ok(())
+        })?;
+
+        for _ in 0..700 {
+            match self.read_response()? {
+                Some(_) => break,
+                _ => continue,
+            }
+        }
 
         Ok(())
     }
 
+    pub fn reset(&mut self) -> Result<(), Error> {
+        let pid = self.port_info.pid;
+        Ok(reset_after_flash(&mut *self.serial, pid)?)
+    }
+
     pub fn reset_to_flash(&mut self, extra_delay: bool) -> Result<(), Error> {
-        self.serial.write_data_terminal_ready(false)?;
-        self.serial.write_request_to_send(true)?;
+        if self.port_info.pid == USB_SERIAL_JTAG_PID {
+            self.serial.write_data_terminal_ready(false)?;
+            self.serial.write_request_to_send(false)?;
 
-        sleep(Duration::from_millis(100));
+            sleep(Duration::from_millis(100));
 
-        self.serial.write_data_terminal_ready(true)?;
-        self.serial.write_request_to_send(false)?;
+            self.serial.write_data_terminal_ready(true)?;
+            self.serial.write_request_to_send(false)?;
 
-        let millis = if extra_delay { 500 } else { 50 };
-        sleep(Duration::from_millis(millis));
+            sleep(Duration::from_millis(100));
 
-        self.serial.write_data_terminal_ready(false)?;
+            self.serial.write_request_to_send(true)?;
+            self.serial.write_data_terminal_ready(false)?;
+            self.serial.write_request_to_send(true)?;
+
+            sleep(Duration::from_millis(100));
+
+            self.serial.write_data_terminal_ready(false)?;
+            self.serial.write_request_to_send(false)?;
+        } else {
+            self.serial.write_data_terminal_ready(false)?;
+            self.serial.write_request_to_send(true)?;
+
+            sleep(Duration::from_millis(100));
+
+            self.serial.write_data_terminal_ready(true)?;
+            self.serial.write_request_to_send(false)?;
+
+            let millis = if extra_delay { 500 } else { 50 };
+            sleep(Duration::from_millis(millis));
+
+            self.serial.write_data_terminal_ready(false)?;
+        }
 
         Ok(())
     }
@@ -101,19 +192,20 @@ impl Connection {
     }
 
     pub fn read_response(&mut self) -> Result<Option<CommandResponse>, Error> {
-        let response = self.read()?;
-        if response.len() < 10 {
-            return Ok(None);
+        match self.read(10)? {
+            None => Ok(None),
+            Some(response) => {
+                let mut cursor = Cursor::new(response);
+                let header = cursor.read_le()?;
+                Ok(Some(header))
+            }
         }
-
-        let mut cursor = Cursor::new(response);
-        let header = cursor.read_le()?;
-
-        Ok(Some(header))
     }
 
     pub fn write_command(&mut self, command: Command) -> Result<(), Error> {
-        let mut encoder = SlipEncoder::new(&mut self.serial)?;
+        self.serial.clear(serialport::ClearBuffer::Input)?;
+        let mut writer = BufWriter::new(&mut self.serial);
+        let mut encoder = SlipEncoder::new(&mut writer)?;
         command.write(&mut encoder)?;
         encoder.finish()?;
         Ok(())
@@ -162,10 +254,14 @@ impl Connection {
         Ok(())
     }
 
-    fn read(&mut self) -> Result<Vec<u8>, Error> {
-        let mut output = Vec::with_capacity(1024);
-        self.decoder.decode(&mut self.serial, &mut output)?;
-        Ok(output)
+    fn read(&mut self, len: usize) -> Result<Option<Vec<u8>>, Error> {
+        let mut tmp = Vec::with_capacity(1024);
+        loop {
+            self.decoder.decode(&mut self.serial, &mut tmp)?;
+            if tmp.len() >= len {
+                return Ok(Some(tmp));
+            }
+        }
     }
 
     pub fn flush(&mut self) -> Result<(), Error> {
@@ -176,4 +272,35 @@ impl Connection {
     pub fn into_serial(self) -> Box<dyn SerialPort> {
         self.serial
     }
+
+    pub fn get_usb_pid(&self) -> Result<u16, Error> {
+        Ok(self.port_info.pid)
+    }
+}
+
+pub fn reset_after_flash(serial: &mut dyn SerialPort, pid: u16) -> Result<(), serialport::Error> {
+    sleep(Duration::from_millis(100));
+
+    if pid == USB_SERIAL_JTAG_PID {
+        serial.write_data_terminal_ready(false)?;
+
+        sleep(Duration::from_millis(100));
+
+        serial.write_request_to_send(true)?;
+        serial.write_data_terminal_ready(false)?;
+        serial.write_request_to_send(true)?;
+
+        sleep(Duration::from_millis(100));
+
+        serial.write_request_to_send(false)?;
+    } else {
+        serial.write_data_terminal_ready(false)?;
+        serial.write_request_to_send(true)?;
+
+        sleep(Duration::from_millis(100));
+
+        serial.write_request_to_send(false)?;
+    }
+
+    Ok(())
 }

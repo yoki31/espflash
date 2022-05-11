@@ -1,13 +1,21 @@
-use crate::command::CommandType;
-use crate::image_format::ImageFormatId;
-use crate::partition_table::{SubType, Type};
-use crate::Chip;
+use std::{
+    fmt::{Display, Formatter},
+    io,
+};
+
 use miette::{Diagnostic, SourceOffset, SourceSpan};
 use slip_codec::SlipError;
-use std::fmt::{Display, Formatter};
-use std::io;
 use strum::VariantNames;
 use thiserror::Error;
+
+use crate::{
+    command::CommandType,
+    elf::{FlashFrequency, FlashMode},
+    flasher::FlashSize,
+    image_format::ImageFormatId,
+    partition_table::{SubType, Type},
+    Chip,
+};
 
 #[derive(Error, Debug, Diagnostic)]
 #[non_exhaustive]
@@ -69,14 +77,40 @@ https://github.com/espressif/esp32c3-direct-boot-example"
         )
     )]
     InvalidDirectBootBinary,
-    #[error("No serial port specified in arguments or config")]
+    #[error("No serial ports could be detected")]
     #[diagnostic(
-        code(cargo_espflash::no_serial),
-        help("Add a command line option with the serial port to use")
+        code(espflash::no_serial),
+        help("Make sure you have connected a device to the host system")
     )]
     NoSerial,
+    #[error("The serial port '{0}' could not be found")]
+    #[diagnostic(
+        code(espflash::serial_not_found),
+        help("Make sure the correct device is connected to the host system")
+    )]
+    SerialNotFound(String),
     #[error("Canceled by user")]
     Canceled,
+    #[error("The flash mode '{0}' is not valid")]
+    #[diagnostic(
+        code(espflash::invalid_flash_mode),
+        help("The accepted values are: {:?}", FlashMode::VARIANTS)
+    )]
+    InvalidFlashMode(String),
+    #[error("The flash frequency '{0}' is not valid")]
+    #[diagnostic(
+        code(espflash::invalid_flash_frequency),
+        help("The accepted values are: {:?}", FlashFrequency::VARIANTS)
+    )]
+    InvalidFlashFrequency(String),
+    #[error("The flash size '{0}' is not valid")]
+    #[diagnostic(
+        code(espflash::invalid_flash_size),
+        help("The accepted values are: {:?}", FlashSize::VARIANTS)
+    )]
+    InvalidFlashSize(String),
+    #[error("The provided bootloader binary is not valid")]
+    InvalidBootloader,
 }
 
 #[derive(Error, Debug, Diagnostic)]
@@ -308,7 +342,22 @@ pub enum PartitionTableError {
     InvalidSubType(#[from] InvalidSubTypeError),
     #[error(transparent)]
     #[diagnostic(transparent)]
+    NoApp(#[from] NoAppError),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
     UnalignedPartitionError(#[from] UnalignedPartitionError),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LengthNotMultipleOf32(#[from] LengthNotMultipleOf32),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InvalidChecksum(#[from] InvalidChecksum),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    NoEndMarker(#[from] NoEndMarker),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InvalidPartitionTable(#[from] InvalidPartitionTable),
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -374,7 +423,8 @@ impl CSVError {
     }
 }
 
-/// since csv doesn't give us the position in the line the error occurs, we highlight the entire line
+/// since csv doesn't give us the position in the line the error occurs, we
+/// highlight the entire line
 ///
 /// line starts at 1
 fn line_to_span(source: &str, line: usize) -> SourceSpan {
@@ -460,6 +510,25 @@ impl InvalidSubTypeError {
 }
 
 #[derive(Debug, Error, Diagnostic)]
+#[error("No app partition was found")]
+#[diagnostic(
+    code(espflash::partition_table::no_app),
+    help("Partition table must contain a factory or ota app partition")
+)]
+pub struct NoAppError {
+    #[source_code]
+    source_code: String,
+}
+
+impl NoAppError {
+    pub fn new(source: &str) -> Self {
+        NoAppError {
+            source_code: source.into(),
+        }
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
 #[error("Unaligned partition")]
 #[diagnostic(code(espflash::partition_table::unaligned))]
 pub struct UnalignedPartitionError {
@@ -477,6 +546,26 @@ impl UnalignedPartitionError {
         }
     }
 }
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("Partition table length not a multiple of 32")]
+#[diagnostic(code(espflash::partition_table::invalid_length))]
+pub struct LengthNotMultipleOf32;
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("Checksum invalid")]
+#[diagnostic(code(espflash::partition_table::invalid_checksum))]
+pub struct InvalidChecksum;
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("No end marker found")]
+#[diagnostic(code(espflash::partition_table::no_end_marker))]
+pub struct NoEndMarker;
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("Invalid partition table")]
+#[diagnostic(code(espflash::partition_table::invalid_partition_table))]
+pub struct InvalidPartitionTable;
 
 #[derive(Debug, Error)]
 #[error("{0}")]
